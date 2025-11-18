@@ -4,7 +4,7 @@ import time
 
 def start_subprocesses_concurrently(n):
     # curl 命令和参数
-    url = "http://localhost:8080/generate"
+    url = "http://molink-master:8080/generate"
     headers = {"Content-Type": "application/json"}
     data = {
         "prompt": "San Francisco is a",

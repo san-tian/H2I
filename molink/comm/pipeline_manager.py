@@ -20,6 +20,7 @@ class PipelineManager():
             return {}
         dht_node_list = json.loads(dht_node_list.decode('utf-8'))
         node_info_dict = {}
+        layer_map = {}
         for node_id in dht_node_list:
             # Every node registered itself into the DHT under its `node_id`.
             node_info = await self.dht.node.get(node_id)
@@ -31,6 +32,8 @@ class PipelineManager():
                 grpc_port = node_info.get('grpc_port')
                 ip = f'{ip}:{grpc_port}'
                 start_layer = node_info.get('start_layer')
+                end_layer = node_info.get('end_layer')
+                layer_map[ip] = (start_layer, end_layer)
                 # We keep only the start layer so that we can sort nodes by layer range.
                 node_info_dict.update({ip : start_layer})
 
@@ -41,6 +44,7 @@ class PipelineManager():
         # Head node: the current node exposing this PipelineManager.
         pipeline_info.update({'head' : f'{self.dht.ip}:{self.dht.node_info.grpc_port}'})
         pipeline_info.update({'server_list' : sorted_ips})
+        pipeline_info.update({'layer_map' : layer_map})
         return pipeline_info
     
     async def run_in_background(self):

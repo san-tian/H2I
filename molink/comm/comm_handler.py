@@ -27,7 +27,7 @@ class CommService(comm_pb2_grpc.CommService):
             start_layer = request.start_layer
             end_layer = request.end_layer
             self.node_pool.append({'ip':node_ip, 'start_layer':start_layer, 'end_layer':end_layer})
-            self.node_info_dict.update({node_ip : start_layer})
+            self.node_info_dict.update({node_ip : (start_layer, end_layer)})
             return comm_pb2.GrpcResponseData(res = 1)
         
         except Exception as e:

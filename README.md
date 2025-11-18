@@ -52,6 +52,42 @@ You can also serve the LLM with a single node, in this case the system falls bac
 python -m molink.entrypoints.api_server --model meta-llama/Llama-2-70b-chat-hf --port 8080 --dtype=half --max_model_len 4096
 ```
 
+## 多节点部署示例（单入口 + 多边缘）
+
+MoLink 支持前段单节点、后段多副本的 pipeline+DP 结构。假设模型共有 80 层：
+
+1) 启动入口/前段（持有 0-39 层，负责调度并执行前半段）：
+```shell
+python -m molink.entrypoints.api_server \
+  --model meta-llama/Llama-2-70b-chat-hf \
+  --port 8080 \
+  --dtype=half \
+  --max_model_len 4096 \
+  --serving_layers 0,39 \
+  --use-dht True
+```
+
+2) 启动后段边缘节点（副本持有相同层 40-79；`--initial-peer` 填入口打印的 DHT 地址；可启动多个副本以分担负载）：
+```shell
+python -m molink.entrypoints.api_server \
+  --model meta-llama/Llama-2-70b-chat-hf \
+  --port 9090 \
+  --dtype=half \
+  --max_model_len 4096 \
+  --serving_layers 40,79 \
+  --initial_peer <entry_dht_ip:port> \
+  --use-dht True
+```
+
+3) 测试：向入口发请求，入口会按“当前在处理请求数最少”的后段副本转发激活：
+```shell
+curl http://localhost:8080/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"San Francisco is a","max_tokens":20,"temperature":0}'
+```
+
+4) 验证：属于同一个模型的前后段层范围必须连续（前段 end + 1 == 后段 start），所有后段副本的 `--serving_layers` 必须相同；不满足会抛出错误。入口日志会打印选择的后段节点和当前 in-flight 数。
+
 For multi-GPU nodes, you can use multiple GPUs for tensor-parallel by specifying argument **--tensor_parallel_size**. It's also supported to run on a hybrid pipeline, for example, the tensor parallelism size of each stage can be different, and devices can be heterogeneous.
 
 The inference service usage are also compatible with vLLM's api server, for example you can simply run (change localhost to your server IP if you're not running at local ):

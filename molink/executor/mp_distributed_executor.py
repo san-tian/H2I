@@ -343,12 +343,17 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
             else:
                 # this is the head node
                 self.comm_handler.node_pool.append({'ip':f'{self.ip}:{self.grpc_port}', 'start_layer':start_layer, 'end_layer':end_layer})
-                self.comm_handler.node_info_dict.update({f'{self.ip}:{self.grpc_port}' : start_layer})
+                self.comm_handler.node_info_dict.update({f'{self.ip}:{self.grpc_port}' : (start_layer, end_layer)})
 
         self.grpc_server.add_insecure_port('[::]:{}'.format(port))
         asyncio.create_task(self._start_grpc_server())
         self.mp_deliver = MultiprocessingDeliver()
         self.mp_deliver.start()
+        # Track per-edge in-flight counts and per-virtual-engine routes for simple load balancing.
+        self.edge_inflight = {}
+        self.virtual_engine_route = {}
+        self.preset_server_list = []
+        self.stub_list = []
         
     async def _start_grpc_server(self):
         try:
@@ -362,6 +367,67 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
     def create_stubs(self, server_list):
         self.preset_server_list = server_list
         self.stub_list = [comm_pb2_grpc.CommServiceStub(aio.insecure_channel(server)) for server in server_list]
+
+    def _select_edge(self, edges: List[str]) -> Optional[str]:
+        if not edges:
+            return None
+        for edge in edges:
+            self.edge_inflight.setdefault(edge, 0)
+        return min(edges, key=lambda e: self.edge_inflight.get(e, 0))
+
+    def  _register_route(self, virtual_engine: int, edge: Optional[str]) -> None:
+        if edge is None:
+            return
+        self.virtual_engine_route[virtual_engine] = edge
+        self.edge_inflight[edge] = self.edge_inflight.get(edge, 0) + 1
+
+    def _clear_route(self, virtual_engine: int) -> None:
+        edge = self.virtual_engine_route.pop(virtual_engine, None)
+        if edge is None:
+            return
+        self.edge_inflight[edge] = max(0, self.edge_inflight.get(edge, 0) - 1)
+
+    def _validate_layer_ranges(self, layer_map: dict, chosen_edge: Optional[str]) -> None:
+        if not layer_map or chosen_edge is None:
+            return
+        try:
+            front_start, front_end = self.pipeline_config.serving_layers
+        except Exception:
+            return
+        edge_range = layer_map.get(chosen_edge)
+        if edge_range is None or len(edge_range) != 2:
+            return
+        edge_start, edge_end = edge_range
+        if front_end + 1 != edge_start:
+            raise ValueError(f"Layer ranges are not contiguous: front [{front_start},{front_end}] "
+                             f"followed by edge [{edge_start},{edge_end}].")
+        for ip, layers in layer_map.items():
+            if ip == f'{self.ip}:{self.grpc_port}':
+                continue
+            if layers != edge_range:
+                raise ValueError(f"Edge replicas must share the same layer range; saw {edge_range} and {layers}.")
+
+    def _prepare_route_metadata(self, grpc_metadata: dict) -> tuple[dict, Optional[str]]:
+        metadata = copy.deepcopy(grpc_metadata) if grpc_metadata else {}
+        server_list_raw = metadata.get('server_list', [])
+        layer_map = metadata.get('layer_map', {})
+
+        if not server_list_raw:
+            head = f'{self.ip}:{self.grpc_port}'
+            edges: List[str] = []
+        else:
+            head = server_list_raw[0]
+            edges = server_list_raw[1:]
+
+        chosen_edge = self._select_edge(edges)
+        route = [head] if chosen_edge is None else [head, chosen_edge]
+
+        if chosen_edge:
+            self._validate_layer_ranges(layer_map, chosen_edge)
+
+        metadata['server_list'] = route
+        metadata['layer_map'] = layer_map
+        return metadata, chosen_edge
 
 
     async def execute_model_async(
@@ -405,26 +471,22 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                     # Non-DHT mode: head server keeps a mapping of node -> start layer.
                     node_info_dict = self.comm_handler.node_info_dict.copy()
                     grpc_metadata = get_grpc_metadata(f'{self.ip}:{self.grpc_port}', node_info_dict)
-                if len(grpc_metadata) <= 0:
-                    server_list_raw = []
-                else:
-                    server_list_raw = grpc_metadata.get('server_list')
-                # Head executes locally; remaining nodes form the downstream pipeline.
-                server_list = server_list_raw[1:]
+                route_metadata, chosen_edge = self._prepare_route_metadata(grpc_metadata)
             
             else:
                 # AutoDL sandbox uses a fixed local host map instead of on-demand metadata.
-                grpc_metadata = {}
-                server_list = P.AUTODL_SERVER_IP_MAP
+                route_metadata = {'server_list': P.AUTODL_SERVER_IP_MAP, 'layer_map': {}}
+                chosen_edge = None
 
             tasks = [
                 # Kick off local execution for the head pipeline stage.
                 # 只有head节点会执行这条命令
-                asyncio.create_task(self.executing_head_server(execute_model_req, grpc_metadata))
+                asyncio.create_task(self.executing_head_server(execute_model_req, route_metadata))
             ]
 
+            server_list = route_metadata.get('server_list', [])[1:]
             build_stub_list = len(self.preset_server_list) != len(server_list)
-            for i in range(len(self.preset_server_list)):
+            for i in range(min(len(self.preset_server_list), len(server_list))):
                 if self.preset_server_list[i] != server_list[i]:
                     build_stub_list = True
                     break
@@ -434,6 +496,9 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                 self.create_stubs(server_list)
 
             virtual_engine = execute_model_req.virtual_engine
+            self._register_route(virtual_engine, chosen_edge)
+            if chosen_edge:
+                print(f'Routing request ve={virtual_engine} to edge {chosen_edge}; in_flight={self.edge_inflight[chosen_edge]}')
 
             trigger_request = comm_pb2.GrpcTriggerRequest(virtual_engine = virtual_engine)
 
@@ -443,7 +508,7 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                 # `CommService` to pop tensors from its queue and continue execution.
                 # call_stub会调用下游节点的gRPC接口, request里面带着virtual engine
                 tasks.append(asyncio.create_task(call_stub(stub, trigger_request)))
-                
+            
             # Wait for the corresponding slot in CommService.output_queue: either
             # final tokens from the last node or an intermediate result if we're last.
             results = await self.comm_handler.output_queue[virtual_engine].get()
@@ -453,6 +518,8 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         except Exception as e:
             print('Encounter the following exception: {}'.format(e))
             traceback.print_exc()
+        finally:
+            self._clear_route(execute_model_req.virtual_engine if execute_model_req else -1)
     
     async def executing_head_server(
         self, 
@@ -506,9 +573,10 @@ async def stub_join_pipeline(stub, node_info):
     return await stub.JoinPipeline(node_info)
 
 def get_grpc_metadata(head_ip, node_info_dict: dict):
-    sorted_ips = [ip for ip, _ in sorted(node_info_dict.items(), key=lambda item: item[1])]
+    sorted_ips = [ip for ip, _ in sorted(node_info_dict.items(), key=lambda item: item[1][0])]
 
     pipeline_info = {}
     pipeline_info.update({'head' : head_ip})
     pipeline_info.update({'server_list' : sorted_ips})
+    pipeline_info.update({'layer_map' : node_info_dict})
     return pipeline_info
