@@ -356,6 +356,7 @@ class Qwen3MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        execute_until_layer: Optional[int] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -368,6 +369,11 @@ class Qwen3MoeModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         for i in range(self.start_layer, self.end_layer):
+            if execute_until_layer is not None and i >= execute_until_layer:
+                return IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
             layer = self.layers[i]
             hidden_states, residual = layer(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
@@ -508,9 +514,10 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        execute_until_layer: Optional[int] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
-                                   inputs_embeds)
+                                   inputs_embeds, execute_until_layer=execute_until_layer)
         return hidden_states
 
     def compute_logits(

@@ -331,6 +331,7 @@ class Qwen2Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        execute_until_layer: Optional[int] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -342,7 +343,13 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+            current_layer_id = self.start_layer + idx
+            if execute_until_layer is not None and current_layer_id >= execute_until_layer:
+                return IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -465,9 +472,10 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        execute_until_layer: Optional[int] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
-                                   inputs_embeds)
+                                   inputs_embeds, execute_until_layer=execute_until_layer)
         return hidden_states
 
     def compute_logits(

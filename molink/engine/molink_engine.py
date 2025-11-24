@@ -67,8 +67,9 @@ class _MolinkEngine(_AsyncLLMEngine):
 
         self.profile_data = {'prefill' : {}, 'decode' : {}}
         first_layer, end_layer = U.get_pp_indices(1, 1, 1)
-        if first_layer == 0:
-            self.prerun_profile()
+        # 我禁用了
+        # if first_layer == 0:
+        #     self.prerun_profile()
 
     async def step_async(
         self, virtual_engine: int, ctx_idx: int
@@ -609,6 +610,7 @@ class MolinkEngine(AsyncLLMEngine):
         return 5
     
     def culculate_batch_num(self): 
+        return 5
         """Heuristically pick how many virtual engines (batches) to run in parallel."""
         # Minimum pipeline parallelism to keep both halves busy.
         base_batch_num = 2

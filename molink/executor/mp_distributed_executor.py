@@ -401,11 +401,6 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         if front_end + 1 != edge_start:
             raise ValueError(f"Layer ranges are not contiguous: front [{front_start},{front_end}] "
                              f"followed by edge [{edge_start},{edge_end}].")
-        for ip, layers in layer_map.items():
-            if ip == f'{self.ip}:{self.grpc_port}':
-                continue
-            if layers != edge_range:
-                raise ValueError(f"Edge replicas must share the same layer range; saw {edge_range} and {layers}.")
 
     def _prepare_route_metadata(self, grpc_metadata: dict) -> tuple[dict, Optional[str]]:
         metadata = copy.deepcopy(grpc_metadata) if grpc_metadata else {}
@@ -477,6 +472,14 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                 # AutoDL sandbox uses a fixed local host map instead of on-demand metadata.
                 route_metadata = {'server_list': P.AUTODL_SERVER_IP_MAP, 'layer_map': {}}
                 chosen_edge = None
+
+            if chosen_edge:
+                layer_map = route_metadata.get('layer_map', {})
+                edge_range = layer_map.get(chosen_edge)
+                if edge_range:
+                    execute_model_req.execute_until_layer = edge_range[0]
+            else:
+                execute_model_req.execute_until_layer = None
 
             tasks = [
                 # Kick off local execution for the head pipeline stage.
