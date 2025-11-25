@@ -70,6 +70,7 @@ def decoding_execute_model_req(msgspec_emq):
     async_callback = msgspec_emq[12]
     execute_until_layer = msgspec_emq[13] if len(msgspec_emq) > 13 else None
     execute_from_layer = msgspec_emq[14] if len(msgspec_emq) > 14 else None
+    target_server_list = msgspec_emq[15] if len(msgspec_emq) > 15 else None
 
     seq_group_metadata_list: List[Union[SequenceGroupMetadata]] = []
     for raw_metadata in seq_group_metadata_list_raw:
@@ -155,5 +156,6 @@ def decoding_execute_model_req(msgspec_emq):
         last_sampled_token_ids=last_sampled_token_ids,
         async_callback=async_callback,
         execute_until_layer=execute_until_layer,
-        execute_from_layer=execute_from_layer
+        execute_from_layer=execute_from_layer,
+        target_server_list=target_server_list
     )

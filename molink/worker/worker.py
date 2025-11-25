@@ -133,6 +133,7 @@ class MolinkWorker(Worker):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
 
+    
         output = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache[0]
@@ -142,6 +143,7 @@ class MolinkWorker(Worker):
             **kwargs,
         )
 
+        # 计算时间
         model_execute_time = time.perf_counter() - start_time
         if not get_pp_group().is_last_rank:
             # output is IntermediateTensors

@@ -40,25 +40,17 @@ class MultiprocessingDeliver(mp.Process):
     def __init__(self):
         super().__init__()
         self.process_queue = mp.Queue(maxsize=100)
-        self.channel_to_next_server = None
-        self.preset_next_server = None
+        self.channels = {}
         self.loop = None
 
-    def _establish_conn_with_next_server(self, next_server):
-        # will be trigger during the ever first run
-        try:
-
-            if self.channel_to_next_server is not None:
-                del self.channel_to_next_server
-            self.channel_to_next_server = aio.insecure_channel(next_server,
+    def _get_channel(self, next_server):
+        if next_server not in self.channels:
+            self.channels[next_server] = aio.insecure_channel(next_server,
                                     options=[
                                         ('grpc.max_send_message_length', 200 * 1024 * 1024),  # 200MB
                                         ('grpc.max_receive_message_length', 200 * 1024 * 1024)  # 200MB
                                     ])
-
-        except Exception as e:
-            print('Encounter the following exception: {}'.format(e))
-            traceback.print_exc()
+        return self.channels[next_server]
 
     def mp_serialize_intermediate_tensors(self, intermediate_tensors, execute_model_req):
         """Serialize activations + ExecuteModelRequest so the next host can consume them."""
@@ -109,17 +101,17 @@ class MultiprocessingDeliver(mp.Process):
 
     async def mp_async_transmit(self, bytes_emr, grpc_intermediate_tensors, grpc_metadata, virtual_engine, next_server):
         try:
-            if self.preset_next_server != next_server:
-                self._establish_conn_with_next_server(next_server)
-                self.preset_next_server = next_server
+            print(f"[Deliver] Start transmitting to {next_server}...")
+            channel = self._get_channel(next_server)
             grpc_request_data = comm_pb2.GrpcRequestData(
                 execute_model_request=bytes_emr,
                 intermediate_tensors=grpc_intermediate_tensors,
                 grpc_metadata=json.dumps(grpc_metadata).encode('utf-8'),
                 virtual_engine=virtual_engine
             )
-            stub = comm_pb2_grpc.CommServiceStub(self.channel_to_next_server)
+            stub = comm_pb2_grpc.CommServiceStub(channel)
             await stub.PushIntermediateTensors(grpc_request_data)
+            print(f"[Deliver] Transmission to {next_server} success.")
             
         except Exception as e:
             print(f'Async transmit error: {e}')
@@ -131,11 +123,11 @@ class MultiprocessingDeliver(mp.Process):
 
     async def mp_async_return_results(self, grpc_sampler_outputs, head_server):
         try:
-            if self.preset_next_server != head_server:
-                self._establish_conn_with_next_server(head_server)
-                self.preset_next_server = head_server
-            stub = comm_pb2_grpc.CommServiceStub(self.channel_to_next_server)
+            print(f"[EdgeDeliver] Sending results to {head_server}...")
+            channel = self._get_channel(head_server)
+            stub = comm_pb2_grpc.CommServiceStub(channel)
             await stub.PushSamplerOutput(grpc_sampler_outputs)
+            print(f"[EdgeDeliver] Sent results to {head_server}.")
 
         except Exception as e:
             print(f'Async return error: {e}')
@@ -150,7 +142,7 @@ class MultiprocessingDeliver(mp.Process):
                 )
 
                 if push_type == 'next':
-                    bytes_emr, grpc_intermediate_tensors = self.mp_serialize_intermediate_tensors(intermediate_tensors_or_sampler_outputs,\
+                    bytes_emr, grpc_intermediate_tensors = self.mp_serialize_intermediate_tensors(intermediate_tensors_or_sampler_outputs,
                                                                                                 execute_model_req)
                     asyncio.create_task(
                         self.mp_async_transmit(bytes_emr, grpc_intermediate_tensors, grpc_metadata, virtual_engine, next_server)
@@ -219,6 +211,7 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         self.channel_to_next_server = None
         self.preset_server_list = []
         self.stub_list = []
+        self.stub_dict = {}
         self.use_dht = False
         self.max_batch_num = 10
 
@@ -387,13 +380,13 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         self.virtual_engine_route[virtual_engine] = edge
         self.edge_inflight[edge] = self.edge_inflight.get(edge, 0) + 1
 
-    def _clear_route(self, virtual_engine: int) -> None:
+    def _clear_route(self, virtual_engine: int) -> None: 
         edge = self.virtual_engine_route.pop(virtual_engine, None)
         if edge is None:
             return
         self.edge_inflight[edge] = max(0, self.edge_inflight.get(edge, 0) - 1)
 
-    def _validate_layer_ranges(self, layer_map: dict, chosen_edge: Optional[str]) -> None:
+    def _validate_layer_ranges(self, layer_map: dict, chosen_edge: Optional[str]) -> None: 
         if not layer_map or chosen_edge is None:
             return
         try:
@@ -453,6 +446,7 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
     ) -> List[SamplerOutput]:
+        # 根据我的推测，这个方法在DC节点上运行，代表一次forward请求的全过程。
         try:
             # Nothing to do if scheduler passed an empty placeholder.
             if execute_model_req is None:
@@ -472,57 +466,135 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                     # Non-DHT mode: head server keeps a mapping of node -> start layer.
                     node_info_dict = self.comm_handler.node_info_dict.copy()
                     grpc_metadata = get_grpc_metadata(f'{self.ip}:{self.grpc_port}', node_info_dict)
-                route_metadata, chosen_edge = self._prepare_route_metadata(grpc_metadata)
-            
+                
+                # Global Stub Update
+                all_edges = grpc_metadata.get('server_list', [])[1:]
+                for s in all_edges:
+                    if s not in self.stub_dict:
+                        self.stub_dict[s] = comm_pb2_grpc.CommServiceStub(
+                            aio.insecure_channel(s, options=[
+                                ('grpc.max_send_message_length', 200 * 1024 * 1024),
+                                ('grpc.max_receive_message_length', 200 * 1024 * 1024)
+                            ])
+                        )
+
+                # Route Calculation
+                edges = all_edges
+                layer_map = grpc_metadata.get('layer_map', {})
+                target_server_list = []
+                max_start_layer = 0
+                
+                # Assign edge for each sequence
+                for _ in execute_model_req.seq_group_metadata_list:
+                    chosen_edge = self._select_edge(edges)
+                    if chosen_edge:
+                        target_server_list.append(chosen_edge)
+                        self._register_route(execute_model_req.virtual_engine, chosen_edge) # Update inflight count
+                        edge_start = layer_map.get(chosen_edge, (0, 0))[0]
+                        max_start_layer = max(max_start_layer, edge_start)
+                    else:
+                        # Fallback if no edges
+                        target_server_list.append(None)
+                
+                execute_model_req.target_server_list = target_server_list
+                if max_start_layer > 0:
+                    execute_model_req.execute_until_layer = max_start_layer
+                else:
+                    execute_model_req.execute_until_layer = None
+
             else:
                 # AutoDL sandbox uses a fixed local host map instead of on-demand metadata.
-                route_metadata = {'server_list': P.AUTODL_SERVER_IP_MAP, 'layer_map': {}}
-                chosen_edge = None
-
-            if chosen_edge:
-                layer_map = route_metadata.get('layer_map', {})
-                edge_range = layer_map.get(chosen_edge)
-                if edge_range:
-                    execute_model_req.execute_until_layer = edge_range[0]
-            else:
+                grpc_metadata = {'server_list': P.AUTODL_SERVER_IP_MAP, 'layer_map': {}}
+                execute_model_req.target_server_list = ['localhost:38000'] * len(execute_model_req.seq_group_metadata_list)
                 execute_model_req.execute_until_layer = None
 
+            # 2. Start Head Execution
+            # We pass grpc_metadata directly, executing_head_server knows what to do
             tasks = [
-                # Kick off local execution for the head pipeline stage.
-                # 只有head节点会执行这条命令
-                asyncio.create_task(self.executing_head_server(execute_model_req, route_metadata))
+                asyncio.create_task(self.executing_head_server(execute_model_req, grpc_metadata))
             ]
 
-            server_list = route_metadata.get('server_list', [])[1:]
-            build_stub_list = len(self.preset_server_list) != len(server_list)
-            for i in range(min(len(self.preset_server_list), len(server_list))):
-                if self.preset_server_list[i] != server_list[i]:
-                    build_stub_list = True
-                    break
+            # 3. Calculate Sent Servers (Who needs to be triggered?)
+            server_indices = {} # 储存每个server负责哪些序列
+            if execute_model_req.target_server_list:
+                for idx, server in enumerate(execute_model_req.target_server_list):
+                    if server not in server_indices:
+                        server_indices[server] = []
+                    server_indices[server].append(idx)
+            
+            sent_servers = {s for s in server_indices.keys() if s}
 
-            if build_stub_list:
-                # Keep gRPC stubs aligned with the latest pipeline membership.
-                self.create_stubs(server_list)
-
+            # 4. Trigger Edges
             virtual_engine = execute_model_req.virtual_engine
-            self._register_route(virtual_engine, chosen_edge)
-            if chosen_edge:
-                print(f'Routing request ve={virtual_engine} to edge {chosen_edge}; in_flight={self.edge_inflight[chosen_edge]}')
-
             trigger_request = comm_pb2.GrpcTriggerRequest(virtual_engine = virtual_engine)
 
-            for pp_rank, stub in enumerate(self.stub_list,
-                                                    start=1):
-                # Trigger downstream nodes asynchronously; each call tells a remote
-                # `CommService` to pop tensors from its queue and continue execution.
-                # call_stub会调用下游节点的gRPC接口, request里面带着virtual engine
-                tasks.append(asyncio.create_task(call_stub(stub, trigger_request)))
-            
-            # Wait for the corresponding slot in CommService.output_queue: either
-            # final tokens from the last node or an intermediate result if we're last.
-            results = await self.comm_handler.output_queue[virtual_engine].get()
+            if not P.IN_AUTODL:
+                for s in sent_servers:
+                    if s in self.stub_dict:
+                        print(f"[Executor] Triggering stub {s}...")
+                        tasks.append(asyncio.create_task(call_stub(self.stub_dict[s], trigger_request)))
+            else:
+                # Legacy trigger for AutoDL
+                for pp_rank, stub in enumerate(self.stub_list, start=1):
+                     tasks.append(asyncio.create_task(call_stub(stub, trigger_request)))
 
-            return results
+            # 5. Wait for Results
+            if not sent_servers and not P.IN_AUTODL:
+                 # Local or fallback
+                 pass
+
+            # 这里为什么要获取第一条请求的id？
+            # 可能是因为所有的序列组共享同一个请求ID，用于追踪和管理异步请求的状态。
+            req_id = execute_model_req.seq_group_metadata_list[0].request_id
+            if req_id not in self.comm_handler.request_futures:
+                self.comm_handler.request_futures[req_id] = {}
+            
+            futures_to_wait = []
+            # Wait for ALL sent servers
+            if sent_servers:
+                print(f"[Executor] Waiting for futures from: {sent_servers}")
+                for s in sent_servers:
+                    fut = asyncio.Future() # Future是一个可等待对象，用于异步操作的结果管理
+                    self.comm_handler.request_futures[req_id][s] = fut
+                    futures_to_wait.append(fut)
+                
+                await asyncio.gather(*futures_to_wait)
+                received_results = {s: f.result() for s, f in self.comm_handler.request_futures[req_id].items()}
+            else:
+                # Legacy queue wait (for AutoDL or single-node fallback)
+                res = await self.comm_handler.output_queue[virtual_engine].get()
+                if isinstance(res, tuple): res = res[0]
+                return res # Legacy return directly
+
+            # Cleanup
+            if req_id in self.comm_handler.request_futures:
+                del self.comm_handler.request_futures[req_id]
+
+            # 6. Merge Results
+            final_outputs_list = [None] * len(execute_model_req.seq_group_metadata_list)
+            base_sampler_output = None
+
+            for server, indices in server_indices.items():
+                if server not in received_results:
+                    continue 
+                
+                sampler_output = received_results[server]
+                
+                if base_sampler_output is None:
+                    base_sampler_output = sampler_output # 这里其实是获取了一个模板，避免重新import这个对象
+                
+                if not hasattr(sampler_output, 'outputs'):
+                    continue
+
+                for local_idx, global_idx in enumerate(indices):
+                    if local_idx < len(sampler_output.outputs):
+                        final_outputs_list[global_idx] = sampler_output.outputs[local_idx]
+
+            if base_sampler_output:
+                base_sampler_output.outputs = final_outputs_list
+                return [base_sampler_output]
+            
+            return []
         
         except Exception as e:
             print('Encounter the following exception: {}'.format(e))
@@ -539,36 +611,94 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
             virtual_engine = execute_model_req.virtual_engine
 
             # 推理
-            async with self.pp_lock:
+            async with self.pp_lock: # 这里的async是 with的异步版本，它依然会阻塞这段代码，但是会释放这个线程
                 outputs = await self.driver_exec_model(execute_model_req)
             
-            if not P.IN_AUTODL:
-                server_list = grpc_metadata.get('server_list', []) if grpc_metadata else []
-                if len(server_list) <= 1:
-                    self.comm_handler.output_queue[virtual_engine].put_nowait(outputs)
-                    return
-
-                next_server = server_list[1]
-
-            else:
-                # if we are in autoDL environment, the next grpc server address should be 
-                # mapped to localhost:38000, since no direct connection is allowed
-                next_server = 'localhost:38000'
-
-            # 处理并发送
             if isinstance(outputs, IntermediateTensors):
                 intermediate_tensors = outputs.tensors
             else:
                 intermediate_tensors = outputs[0]
 
-            intermediate_tensors_cpu = {k: v.to('cpu') for k, v in intermediate_tensors.items()}
+            # Group indices by target server
+            server_indices = {}
+            if execute_model_req.target_server_list:
+                for idx, server in enumerate(execute_model_req.target_server_list):
+                    if server not in server_indices:
+                        server_indices[server] = []
+                    server_indices[server].append(idx) # 储存每个server负责哪些序列，这刚才不是算过了吗？
+            else:
+                # Fallback for legacy/single-server mode
+                if not P.IN_AUTODL:
+                    server_list = grpc_metadata.get('server_list', []) if grpc_metadata else []
+                    next_server = server_list[1] if len(server_list) > 1 else None
+                else:
+                    next_server = 'localhost:38000'
+                
+                if next_server:
+                    server_indices[next_server] = list(range(len(execute_model_req.seq_group_metadata_list)))
 
-            # data serializetion and transmission will be handled in another process
-            # thus this process would be overlapped with the valuable computation
+            # Calculate token ranges for each sequence group
+            # 每个请求占一个token位置，也就是一个chunk大小，chunk_size默认为1
+            token_ranges = []
+            current_offset = 0
+            for seq_group_meta in execute_model_req.seq_group_metadata_list:
+                # token_chunk_size indicates how many tokens this sequence contributes to the batch
+                chunk_size = getattr(seq_group_meta, 'token_chunk_size', 1)
+                if chunk_size is None:
+                    chunk_size = 1
+                token_ranges.append((current_offset, current_offset + chunk_size))
+                current_offset += chunk_size
 
-            execute_model_req.async_callback = None
-            self.mp_deliver.process_queue.put_nowait((intermediate_tensors_cpu, execute_model_req, grpc_metadata, \
-                                                     virtual_engine, next_server, 'next'))
+            # Scatter and Send
+            for next_server, indices in server_indices.items():
+                if next_server is None:
+                    continue
+
+                # Calculate token indices for this server
+                token_indices_list = []
+                # example:[0,1,  5,6,7,  10,11] 代表server负责的token index,不连续是因为分配给这个server的seq可能是不连续的
+                for seq_idx in indices:
+                    start, end = token_ranges[seq_idx]
+                    token_indices_list.extend(range(start, end)) # 将[3,4,5,6]插入list的后面,最后会形成一个完整的token index list
+
+                # Slice Tensors
+                intermediate_tensors_cpu = {}
+                # Assume tensors are on the same device as the first one
+                if intermediate_tensors:
+                    first_tensor = next(iter(intermediate_tensors.values()))  # next iter就是从字典中取第一个元素,比list()[0]更快
+                    device = first_tensor.device
+                    indices_tensor = torch.tensor(token_indices_list, device=device) # 把token index list变成tensor,
+                    # 因为PyTorch 的张量切片操作（如 index_select）要求 index 必须是一个和张量相同device的tensor，不能是 Python list
+                    
+                    for k, v in intermediate_tensors.items(): # 中间值就是KV, 我要查一下,为什么layer的中间值是KV对?不应该是hidden state吗?
+                        # 确实应该传hidden, 这里的kv不知道是什么东西,可能就是hidden?
+                        # v is [Total_Tokens, ...]
+                        sliced = v.index_select(0, indices_tensor).to('cpu') # 按照token index选取对应的tensor slice，并搬运到cpu上
+                        intermediate_tensors_cpu[k] = sliced
+
+                # Slice Request
+                # Create a shallow copy and replace seq_groups
+                # Note: msgspec structs are immutable by default?
+                # No, defined as Struct, mutable unless frozen=True.
+                # But here we want a copy.
+                partial_seq_groups = [execute_model_req.seq_group_metadata_list[i] for i in indices]
+                
+                # Use msgspec.structs.replace logic manually or construct new
+                # Since we can't easily import msgspec.structs here without check
+                # Let's assign to a new instance if possible, or modify a copy.
+                # ExecuteModelRequest is not frozen.
+                
+                partial_req = copy.copy(execute_model_req)
+                partial_req.seq_group_metadata_list = partial_seq_groups
+                # Use target_server_list as a carrier for routing tag (the server address)
+                req_id = execute_model_req.seq_group_metadata_list[0].request_id
+                partial_req.target_server_list = [next_server, req_id]
+                
+                print(f"[HeadServer] Scattering to {next_server} with ReqID={req_id}")
+                
+                # 每个server都会push这一次,包含多个req
+                self.mp_deliver.process_queue.put_nowait((intermediate_tensors_cpu, partial_req, grpc_metadata, \
+                                                         virtual_engine, next_server, 'next'))
 
         except Exception as e:
             print(f'Exception in executing_head_server: {e}')

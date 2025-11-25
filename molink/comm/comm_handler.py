@@ -17,6 +17,7 @@ class CommService(comm_pb2_grpc.CommService):
         self.bind_executor = executor
         self.input_queue = [asyncio.Queue() for _ in range(pipeline_size)]
         self.output_queue = [asyncio.Queue() for _ in range(pipeline_size)]
+        self.request_futures = {} # request_id -> { server_tag -> Future }
         self.pp_lock = asyncio.Lock()
         self.node_pool = []
         self.node_info_dict = {}
@@ -37,6 +38,7 @@ class CommService(comm_pb2_grpc.CommService):
 
     async def PushIntermediateTensors(self, request: comm_pb2.GrpcRequestData, context: aio.ServicerContext):
         try:
+            print(f"[EdgeComm] Received PushIntermediateTensors from peer.")
             #event, request = await self._handler_event_queue.get()
             execute_model_req = request.execute_model_request
             intermediate_tensors = request.intermediate_tensors
@@ -64,8 +66,35 @@ class CommService(comm_pb2_grpc.CommService):
         try:
             virtual_engine = result.virtual_engine
             outputs = msgspec.json.decode(result.output_data)
-            outputs = [decoding_sampler_outputs(outputs)]
-            self.output_queue[virtual_engine].put_nowait(outputs)
+            
+            routing_tag = None
+            req_id = None
+            
+            # Check payload structure: [data, tag, req_id]
+            if isinstance(outputs, list) and len(outputs) >= 3 and isinstance(outputs[-2], str):
+                routing_tag = outputs[-2]
+                req_id = outputs[-1]
+                outputs = outputs[0]
+            elif isinstance(outputs, list) and len(outputs) == 2 and isinstance(outputs[1], str):
+                routing_tag = outputs[1]
+                outputs = outputs[0]
+
+            print(f"[Comm] Received result. Tag={routing_tag}, ReqID={req_id}")
+            
+            decoded_output = decoding_sampler_outputs(outputs)
+            
+            if req_id and req_id in self.request_futures:
+                print(f"[Comm] Found future for ReqID={req_id}")
+                if routing_tag in self.request_futures[req_id]:
+                    print(f"[Comm] Setting result for Tag={routing_tag}")
+                    self.request_futures[req_id][routing_tag].set_result(decoded_output)
+                    return comm_pb2.GrpcResponseData(res = 1)
+                else:
+                    print(f"[Comm] WARNING: Tag {routing_tag} not found in futures for {req_id}. Keys: {list(self.request_futures[req_id].keys())}")
+            else:
+                print(f"[Comm] ReqID {req_id} not found in futures. Known IDs: {list(self.request_futures.keys())}")
+
+            self.output_queue[virtual_engine].put_nowait((decoded_output, routing_tag))
             return comm_pb2.GrpcResponseData(res = 1)
         
         except Exception as e:
@@ -76,9 +105,11 @@ class CommService(comm_pb2_grpc.CommService):
     async def ExecutingWorkerStep(self, request: comm_pb2.GrpcTriggerRequest, context: aio.ServicerContext):
 
         try:
+            print(f"[Edge] ExecutingWorkerStep triggered.")
             virtual_engine = request.virtual_engine
             # 这步会阻塞,等待上一层节点计算完毕
             execute_model_req, intermediate_tensors, grpc_metadata = await self.input_queue[virtual_engine].get()
+            print(f"[Edge] Input dequeued.")
 
             # 将张量反序列化操作提交到线程池
             def process_tensors(intermediate_tensors):
@@ -89,6 +120,7 @@ class CommService(comm_pb2_grpc.CommService):
                 return temp
             
             intermediate_tensors = await asyncio.to_thread(process_tensors, intermediate_tensors)
+            print(f"[Edge] Tensors processed.")
 
             if self.bind_executor.parallel_worker_tasks is None:
                 # Start model execution loop running in the parallel workers
@@ -96,7 +128,9 @@ class CommService(comm_pb2_grpc.CommService):
                     self.bind_executor._start_worker_execution_loop())
 
             async with self.pp_lock:
+                print(f"[Edge] Running model...")
                 pipeline_outputs = await self.bind_executor.driver_exec_model(execute_model_req, intermediate_tensors)
+                print(f"[Edge] Model run finished. Output type: {type(pipeline_outputs)}")
 
                 
             pipeline_outputs = pipeline_outputs[0]
@@ -141,6 +175,13 @@ class CommService(comm_pb2_grpc.CommService):
                 head_server = grpc_metadata.get('head')
             else :
                 head_server = 'localhost:38000'
+            
+            # Inject Routing Tag if available
+            if execute_model_req.target_server_list:
+                tags = execute_model_req.target_server_list
+                # Payload structure: [original_output, tag1, tag2...]
+                pipeline_outputs = [pipeline_outputs] + tags
+
             self.bind_executor.mp_deliver.process_queue.put_nowait((pipeline_outputs, execute_model_req, grpc_metadata, \
                             virtual_engine, head_server, 'head'))
             
