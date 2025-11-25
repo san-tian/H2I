@@ -86,6 +86,7 @@ class MultiprocessingDeliver(mp.Process):
         # Callbacks and multimodal payloads are only valid inside the original process;
         # drop them before encoding to avoid pickling issues downstream.
         execute_model_req.async_callback = None
+        execute_model_req.execute_until_layer = None
         for seq_group in execute_model_req.seq_group_metadata_list:
             seq_group.multi_modal_data = None
             seq_group.multi_modal_placeholders = None
@@ -398,9 +399,9 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         if edge_range is None or len(edge_range) != 2:
             return
         edge_start, edge_end = edge_range
-        if front_end + 1 != edge_start:
+        if front_end < edge_start - 1:
             raise ValueError(f"Layer ranges are not contiguous: front [{front_start},{front_end}] "
-                             f"followed by edge [{edge_start},{edge_end}].")
+                             f"followed by edge [{edge_start},{edge_end}]. Front must reach at least layer {edge_start - 1}.")
 
     def _prepare_route_metadata(self, grpc_metadata: dict) -> tuple[dict, Optional[str]]:
         metadata = copy.deepcopy(grpc_metadata) if grpc_metadata else {}
@@ -550,7 +551,10 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                 next_server = 'localhost:38000'
 
             # 处理并发送
-            intermediate_tensors = outputs[0]
+            if isinstance(outputs, IntermediateTensors):
+                intermediate_tensors = outputs.tensors
+            else:
+                intermediate_tensors = outputs[0]
 
             intermediate_tensors_cpu = {k: v.to('cpu') for k, v in intermediate_tensors.items()}
 

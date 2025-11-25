@@ -53,7 +53,7 @@ def decoding_sampler_outputs(msgspec_sampelr_outputs):
         deferred_sample_results_args=deferred_sample_results_args)
 
 def decoding_execute_model_req(msgspec_emq):
-    assert len(msgspec_emq) == 13, 'Wrong length of ExecuteModelRequest'
+    #assert len(msgspec_emq) == 13, 'Wrong length of ExecuteModelRequest'
 
     seq_group_metadata_list_raw = msgspec_emq[0]
     blocks_to_swap_in = msgspec_emq[1]
@@ -68,6 +68,7 @@ def decoding_execute_model_req(msgspec_emq):
     finished_requests_ids = msgspec_emq[10]
     last_sampled_token_ids = msgspec_emq[11]
     async_callback = msgspec_emq[12]
+    execute_until_layer = msgspec_emq[13] if len(msgspec_emq) > 13 else None
 
     seq_group_metadata_list: List[Union[SequenceGroupMetadata]] = []
     for raw_metadata in seq_group_metadata_list_raw:
@@ -151,5 +152,6 @@ def decoding_execute_model_req(msgspec_emq):
         spec_step_idx = spec_step_idx,
         finished_requests_ids=finished_requests_ids,
         last_sampled_token_ids=last_sampled_token_ids,
-        async_callback=async_callback
+        async_callback=async_callback,
+        execute_until_layer=execute_until_layer
     )

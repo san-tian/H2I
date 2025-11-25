@@ -21,11 +21,11 @@ def send_request(index, url, headers, data):
 
 
 def start_requests_concurrently(batch_size, interval):
-    url = "http://localhost:8080/generate"
+    url = "http://molink-master:8080/generate"
     headers = {"Content-Type": "application/json"}
     data = {
         "prompt": "San Francisco is a",
-        "max_tokens": 30,
+        "max_tokens": 100,
         "temperature": 0
     }
     request_count = 0

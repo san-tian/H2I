@@ -8,7 +8,7 @@ def start_subprocesses_concurrently(n):
     headers = {"Content-Type": "application/json"}
     data = {
         "prompt": "San Francisco is a",
-        "max_tokens": 30,
+        "max_tokens": 2000,
         "temperature": 0
     }
     data_str = json.dumps(data)
