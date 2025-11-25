@@ -297,9 +297,11 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         execute_until_layer: Optional[int] = None,
+        execute_from_layer: Optional[int] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
-                                   inputs_embeds, execute_until_layer=execute_until_layer)
+                                   inputs_embeds, execute_until_layer=execute_until_layer,
+                                   execute_from_layer=execute_from_layer)
         return hidden_states
 
     def compute_logits(

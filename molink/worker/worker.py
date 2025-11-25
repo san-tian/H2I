@@ -202,6 +202,8 @@ class MolinkWorker(Worker):
         kwargs = extract_previous_hidden_states(execute_model_req)
         if execute_model_req.execute_until_layer is not None:
             kwargs['execute_until_layer'] = execute_model_req.execute_until_layer
+        if execute_model_req.execute_from_layer is not None:
+            kwargs['execute_from_layer'] = execute_model_req.execute_from_layer
 
         if self.do_metadata_broadcast:
             broadcast_data = worker_input.as_broadcastable_tensor_dict()

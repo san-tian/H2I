@@ -86,7 +86,12 @@ class MultiprocessingDeliver(mp.Process):
         # Callbacks and multimodal payloads are only valid inside the original process;
         # drop them before encoding to avoid pickling issues downstream.
         execute_model_req.async_callback = None
-        execute_model_req.execute_until_layer = None
+        
+        if execute_model_req.execute_until_layer is not None:
+            # If we stopped early at layer K, the next node should start from layer K.
+            execute_model_req.execute_from_layer = execute_model_req.execute_until_layer
+            execute_model_req.execute_until_layer = None
+        
         for seq_group in execute_model_req.seq_group_metadata_list:
             seq_group.multi_modal_data = None
             seq_group.multi_modal_placeholders = None
