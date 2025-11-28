@@ -355,6 +355,12 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
         self.virtual_engine_route = {}
         self.preset_server_list = []
         self.stub_list = []
+        # Per-request routing state: request_id -> {"edge": str, "cut_layer": int}
+        self.request_routes: Dict[str, Dict[str, Union[str, int]]] = {}
+        # Track edges that recently failed; the balancer avoids them.
+        self.unhealthy_edges: Set[str] = set()
+        # Timeout while waiting for downstream edge results (seconds).
+        self.edge_timeout_s = 30.0
         
     async def _start_grpc_server(self):
         try:
@@ -372,6 +378,11 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
     def _select_edge(self, edges: List[str]) -> Optional[str]:
         if not edges:
             return None
+        # Skip unhealthy edges when balancing.
+        healthy_edges = [e for e in edges if e not in self.unhealthy_edges]
+        if not healthy_edges:
+            return None
+        edges = healthy_edges
         for edge in edges:
             self.edge_inflight.setdefault(edge, 0)
         return min(edges, key=lambda e: self.edge_inflight.get(e, 0))
@@ -388,6 +399,38 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
             return
         self.edge_inflight[edge] = max(0, self.edge_inflight.get(edge, 0) - 1)
 
+    def _extract_request_ids(self, execute_model_req: ExecuteModelRequest) -> List[str]:
+        req_ids: List[str] = []
+        if execute_model_req is None:
+            return req_ids
+        for sg in execute_model_req.seq_group_metadata_list:
+            rid = getattr(sg, "request_id", None)
+            if rid is not None:
+                req_ids.append(rid)
+        return req_ids
+
+    def _get_consistent_route(self, request_ids: List[str]) -> tuple[Optional[Dict[str, Union[str, int]]], bool]:
+        """Return existing route if all requests share the same one; flag conflicts."""
+        routes = [self.request_routes.get(rid) for rid in request_ids if rid in self.request_routes]
+        routes = [r for r in routes if r]
+        if not routes:
+            return None, False
+        first = routes[0]
+        for r in routes[1:]:
+            if r != first:
+                return None, True
+        return first, False
+
+    def _store_route(self, request_ids: List[str], edge: Optional[str], cut_layer: Optional[int]) -> None:
+        if edge is None or cut_layer is None:
+            return
+        for rid in request_ids:
+            self.request_routes[rid] = {"edge": edge, "cut_layer": cut_layer}
+
+    def _clear_route_for_requests(self, request_ids: List[str]) -> None:
+        for rid in request_ids:
+            self.request_routes.pop(rid, None)
+
     def _validate_layer_ranges(self, layer_map: dict, chosen_edge: Optional[str]) -> None:
         if not layer_map or chosen_edge is None:
             return
@@ -403,10 +446,11 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
             raise ValueError(f"Layer ranges are not contiguous: front [{front_start},{front_end}] "
                              f"followed by edge [{edge_start},{edge_end}]. Front must reach at least layer {edge_start - 1}.")
 
-    def _prepare_route_metadata(self, grpc_metadata: dict) -> tuple[dict, Optional[str]]:
+    def _prepare_route_metadata(self, grpc_metadata: dict, execute_model_req: ExecuteModelRequest) -> tuple[dict, Optional[str], Optional[int]]:
         metadata = copy.deepcopy(grpc_metadata) if grpc_metadata else {}
         server_list_raw = metadata.get('server_list', [])
         layer_map = metadata.get('layer_map', {})
+        request_ids = self._extract_request_ids(execute_model_req)
 
         if not server_list_raw:
             head = f'{self.ip}:{self.grpc_port}'
@@ -415,7 +459,31 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
             head = server_list_raw[0]
             edges = server_list_raw[1:]
 
-        chosen_edge = self._select_edge(edges)
+        existing_route, route_conflict = self._get_consistent_route(request_ids)
+        if route_conflict:
+            # Mixed cut points in one batch: route locally to avoid overwriting bindings.
+            metadata['server_list'] = [head]
+            metadata['layer_map'] = layer_map
+            return metadata, None, None
+        chosen_edge = None
+        cut_layer = None
+
+        # Reuse existing binding if still available and healthy.
+        if existing_route:
+            maybe_edge = existing_route.get("edge")
+            maybe_cut = existing_route.get("cut_layer")
+            if maybe_edge in edges and maybe_edge not in self.unhealthy_edges:
+                chosen_edge = maybe_edge
+                cut_layer = maybe_cut if isinstance(maybe_cut, int) else None
+
+        # Otherwise, pick a new edge.
+        if chosen_edge is None:
+            chosen_edge = self._select_edge(edges)
+            if chosen_edge:
+                edge_range = layer_map.get(chosen_edge)
+                if edge_range and len(edge_range) == 2:
+                    cut_layer = edge_range[0]
+
         route = [head] if chosen_edge is None else [head, chosen_edge]
 
         if chosen_edge:
@@ -423,7 +491,7 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
 
         metadata['server_list'] = route
         metadata['layer_map'] = layer_map
-        return metadata, chosen_edge
+        return metadata, chosen_edge, cut_layer
 
 
     async def execute_model_async(
@@ -467,20 +535,31 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                     # Non-DHT mode: head server keeps a mapping of node -> start layer.
                     node_info_dict = self.comm_handler.node_info_dict.copy()
                     grpc_metadata = get_grpc_metadata(f'{self.ip}:{self.grpc_port}', node_info_dict)
-                route_metadata, chosen_edge = self._prepare_route_metadata(grpc_metadata)
+                route_metadata, chosen_edge, cut_layer = self._prepare_route_metadata(grpc_metadata, execute_model_req)
             
             else:
                 # AutoDL sandbox uses a fixed local host map instead of on-demand metadata.
                 route_metadata = {'server_list': P.AUTODL_SERVER_IP_MAP, 'layer_map': {}}
                 chosen_edge = None
+                cut_layer = None
 
             if chosen_edge:
                 layer_map = route_metadata.get('layer_map', {})
                 edge_range = layer_map.get(chosen_edge)
                 if edge_range:
                     execute_model_req.execute_until_layer = edge_range[0]
+                    cut_layer = edge_range[0]
             else:
                 execute_model_req.execute_until_layer = None
+
+            request_ids = self._extract_request_ids(execute_model_req)
+            if cut_layer is not None:
+                self._store_route(request_ids, chosen_edge, cut_layer)
+            # One-line summary per forward: how many requests, which edge, which VE.
+            num_reqs = len(request_ids)
+            ve_id = execute_model_req.virtual_engine
+            target = chosen_edge if chosen_edge else "head"
+            print(f"[route] ve={ve_id} reqs={num_reqs} cut={cut_layer} -> {target}")
 
             tasks = [
                 # Kick off local execution for the head pipeline stage.
@@ -513,11 +592,24 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                 # call_stub会调用下游节点的gRPC接口, request里面带着virtual engine
                 tasks.append(asyncio.create_task(call_stub(stub, trigger_request)))
             
-            # Wait for the corresponding slot in CommService.output_queue: either
-            # final tokens from the last node or an intermediate result if we're last.
-            results = await self.comm_handler.output_queue[virtual_engine].get()
-
-            return results
+            try:
+                # Wait for the corresponding slot in CommService.output_queue: either
+                # final tokens from the last node or an intermediate result if we're last.
+                results = await asyncio.wait_for(
+                    self.comm_handler.output_queue[virtual_engine].get(),
+                    timeout=self.edge_timeout_s if chosen_edge else None,
+                )
+                return results
+            except Exception as e:
+                # Downstream edge failed or stalled; fall back to head-only execution.
+                print(f'Edge routing failed ({e}), falling back to head for requests {request_ids}')
+                if chosen_edge:
+                    self.unhealthy_edges.add(chosen_edge)
+                self._clear_route_for_requests(request_ids)
+                execute_model_req.execute_until_layer = None
+                async with self.pp_lock:
+                    local_outputs = await self.driver_exec_model(execute_model_req)
+                return local_outputs
         
         except Exception as e:
             print('Encounter the following exception: {}'.format(e))

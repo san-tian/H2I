@@ -28,6 +28,10 @@ class MolinkScheduler(Scheduler):
         # records the requests that have been scheduled by former micro batches
         self.requests_on_fly = set()
         self.schedule_limit = 10
+        # Track preferred cut layer per request_id to allow per-cut scheduling.
+        self.req_cut_map = {}
+        # Round-robin index over available cut layers.
+        self.cut_rr_idx = 0
 
     def set_schedule_limit(self, schedule_limit: int):
         self.schedule_limit = schedule_limit
@@ -35,6 +39,33 @@ class MolinkScheduler(Scheduler):
     def _mark_seq_as_schedule_free(self, request_id: str):
         if request_id in self.requests_on_fly:
             self.requests_on_fly.remove(request_id)
+        # Keep cut mapping until explicitly cleared; caller may clear when request finishes.
+
+    def update_cut_layer(self, request_id: str, cut_layer: Optional[int]):
+        """Record the cut_layer chosen for this request."""
+        self.req_cut_map[request_id] = cut_layer
+
+    def clear_cut_layer(self, request_id: str):
+        self.req_cut_map.pop(request_id, None)
+
+    def get_available_cut_layers(self):
+        """Collect cut layers present in waiting/running/swapped queues."""
+        cuts = set()
+        for q in (self.waiting, self.running, self.swapped):
+            for sg in q:
+                rid = getattr(sg, "request_id", None)
+                cut = self.req_cut_map.get(rid, None)
+                cuts.add(cut)
+        if not cuts:
+            cuts.add(None)
+        return sorted(list(cuts))
+
+    def _should_skip_cut(self, seq_group, target_cut_layer: Optional[int]):
+        if target_cut_layer is None:
+            return False
+        rid = getattr(seq_group, "request_id", None)
+        cut = self.req_cut_map.get(rid, None)
+        return cut is not None and cut != target_cut_layer
 
     def _schedule_running(
         self,
@@ -42,6 +73,7 @@ class MolinkScheduler(Scheduler):
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
         partial_prefill_metadata: Optional[PartialPrefillMetadata] = None,
+        target_cut_layer: Optional[int] = None,
     ) -> SchedulerRunningOutputs:
 
         try:
@@ -95,6 +127,11 @@ class MolinkScheduler(Scheduler):
                 # judge if a seq group has already been scheduled by other batches
                 request_id = seq_group.request_id
                 if request_id in self.requests_on_fly:
+                    running_queue.popleft()
+                    reserve_queue.append(seq_group)
+                    continue
+                # skip if not in target cut_layer bucket
+                if self._should_skip_cut(seq_group, target_cut_layer):
                     running_queue.popleft()
                     reserve_queue.append(seq_group)
                     continue
@@ -225,6 +262,7 @@ class MolinkScheduler(Scheduler):
         budget: SchedulingBudget,
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
+        target_cut_layer: Optional[int] = None,
     ) -> SchedulerSwappedInOutputs:
 
         # Blocks that need to be swapped or copied before model execution.
@@ -246,6 +284,11 @@ class MolinkScheduler(Scheduler):
             # judge if a request has already been scheduled by other batches
             request_id = seq_group.request_id
             if request_id in self.requests_on_fly:
+                swapped_queue.popleft()
+                reserve_queue.append(seq_group)
+                continue
+            # skip if not in target cut_layer bucket
+            if self._should_skip_cut(seq_group, target_cut_layer):
                 swapped_queue.popleft()
                 reserve_queue.append(seq_group)
                 continue
@@ -343,6 +386,7 @@ class MolinkScheduler(Scheduler):
         curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
         partial_prefill_metadata: Optional[PartialPrefillMetadata] = None,
+        target_cut_layer: Optional[int] = None,
     ) -> SchedulerPrefillOutputs:
         if budget.remaining_token_budget() == 0:
             # Do nothing: Can't add any more prefill anyway
@@ -374,6 +418,11 @@ class MolinkScheduler(Scheduler):
             # judge if a request has already been scheduled by other batches
             request_id = seq_group.request_id
             if request_id in self.requests_on_fly:
+                waiting_queue.popleft()
+                reserve_queue.append(seq_group)
+                continue
+            # skip if not in target cut_layer bucket
+            if self._should_skip_cut(seq_group, target_cut_layer):
                 waiting_queue.popleft()
                 reserve_queue.append(seq_group)
                 continue

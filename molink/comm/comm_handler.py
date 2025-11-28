@@ -78,6 +78,7 @@ class CommService(comm_pb2_grpc.CommService):
         try:
             virtual_engine = request.virtual_engine
             # 这步会阻塞,等待上一层节点计算完毕
+            # 同时这里也体现出，worker是串行执行请求的，也就是逐个micro batch执行，如果上一个没完成，下一个batch会在queue中等候
             execute_model_req, intermediate_tensors, grpc_metadata = await self.input_queue[virtual_engine].get()
 
             # 将张量反序列化操作提交到线程池

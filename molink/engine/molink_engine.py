@@ -1,6 +1,7 @@
 
 from typing import (Dict, List, Optional, Type, Union)
 import asyncio
+from collections import deque
 import torch
 from functools import partial
 from weakref import ReferenceType
@@ -34,6 +35,12 @@ class _MolinkEngine(_AsyncLLMEngine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_batch_num = 10
+        # Buckets pending requests by cut_layer to avoid mixing cut points in one batch.
+        # key: cut_layer (int or None for head-only), value: list of request_ids in that bucket
+        self.cut_buckets: Dict[Optional[int], List[str]] = {}
+        # Round-robin pointer per virtual engine for cut-layer scheduling.
+        ve_count = self.parallel_config.pipeline_parallel_size or 1
+        self.cut_rr_idx: List[int] = [0 for _ in range(max(self.max_batch_num, ve_count))]
         self.scheduler = [
             MolinkScheduler(
                 self.scheduler_config, self.cache_config, self.lora_config,
@@ -242,6 +249,77 @@ class _MolinkEngine(_AsyncLLMEngine):
         for seq_group in seq_group_metadata_list:
             request_id = seq_group.request_id
             self.scheduler[0]._mark_seq_as_schedule_free(request_id)
+            # Also drop from per-cut buckets if present.
+            for bucket in self.cut_buckets.values():
+                if request_id in bucket:
+                    try:
+                        bucket.remove(request_id)
+                    except ValueError:
+                        pass
+
+    def _get_cut_layer_for_request(self, request_id: Optional[str]) -> Optional[int]:
+        if request_id is None:
+            return None
+        try:
+            return self.engine.model_executor.request_routes.get(request_id, {}).get("cut_layer")
+        except Exception:
+            return None
+
+    def _collect_available_cuts(self, virtual_engine: int):
+        sched = self.scheduler[virtual_engine]
+        cuts = set()
+        for q in (sched.waiting, sched.running, sched.swapped):
+            for sg in q:
+                rid = getattr(sg, "request_id", None)
+                cuts.add(self._get_cut_layer_for_request(rid))
+        if not cuts:
+            cuts.add(None)
+        return sorted(list(cuts))
+
+    def _filter_scheduler_queues(self, virtual_engine: int, target_cut: Optional[int]):
+        """Temporarily remove seq_groups not matching target_cut; return saved entries for restoration."""
+        sched = self.scheduler[virtual_engine]
+        saved = {"waiting": [], "running": [], "swapped": []}
+
+        def filter_queue(queue, key):
+            kept = deque()
+            removed = []
+            while queue:
+                sg = queue.popleft()
+                rid = getattr(sg, "request_id", None)
+                cut = self._get_cut_layer_for_request(rid)
+                if target_cut is None:
+                    # Only keep requests with unknown/None cut in the None bucket.
+                    if cut is None:
+                        kept.append(sg)
+                    else:
+                        removed.append(sg)
+                else:
+                    # Keep only matching cut_layer; drop others (including None).
+                    if cut == target_cut:
+                        kept.append(sg)
+                    else:
+                        removed.append(sg)
+            queue.extend(kept)
+            saved[key] = removed
+
+        filter_queue(sched.waiting, "waiting")
+        filter_queue(sched.running, "running")
+        filter_queue(sched.swapped, "swapped")
+        return saved
+
+    def _restore_scheduler_queues(self, virtual_engine: int, saved):
+        sched = self.scheduler[virtual_engine]
+
+        def restore(queue, removed):
+            # Restore in original order at the front.
+            if not removed:
+                return
+            queue.extendleft(reversed(removed))
+
+        restore(sched.swapped, saved.get("swapped", []))
+        restore(sched.running, saved.get("running", []))
+        restore(sched.waiting, saved.get("waiting", []))
 
     def generate_profile_data(self, is_prefill, seq_len, batch_size):
         if is_prefill:
@@ -398,6 +476,71 @@ class MolinkEngine(AsyncLLMEngine):
         del kwargs['autodl_worker_num']
 
         super().__init__(*args, **kwargs)
+        ve_count = self.engine.parallel_config.pipeline_parallel_size if hasattr(self, "engine") else 1
+        max_batches = getattr(self.engine, "max_batch_num", 10)
+        self.cut_rr_idx: List[int] = [0 for _ in range(max(max_batches, ve_count))]
+
+    def _get_cut_layer_for_request(self, request_id: Optional[str]) -> Optional[int]:
+        if request_id is None:
+            return None
+        try:
+            return self.engine.model_executor.request_routes.get(request_id, {}).get("cut_layer")
+        except Exception:
+            return None
+
+    def _collect_available_cuts(self, virtual_engine: int):
+        sched = self.engine.scheduler[virtual_engine]
+        cuts = set()
+        for q in (sched.waiting, sched.running, sched.swapped):
+            for sg in q:
+                rid = getattr(sg, "request_id", None)
+                cuts.add(self._get_cut_layer_for_request(rid))
+        if not cuts:
+            cuts.add(None)
+        # Sort with None first to avoid int/None comparison issues.
+        return sorted(cuts, key=lambda x: (1, x) if x is not None else (0, -1))
+
+    def _filter_scheduler_queues(self, virtual_engine: int, target_cut: Optional[int]):
+        """Temporarily remove seq_groups not matching target_cut; return saved entries for restoration."""
+        sched = self.engine.scheduler[virtual_engine]
+        saved = {"waiting": [], "running": [], "swapped": []}
+
+        def filter_queue(queue, key):
+            kept = deque()
+            removed = []
+            while queue:
+                sg = queue.popleft()
+                rid = getattr(sg, "request_id", None)
+                cut = self._get_cut_layer_for_request(rid)
+                if target_cut is None:
+                    if cut is None:
+                        kept.append(sg)
+                    else:
+                        removed.append(sg)
+                else:
+                    if cut == target_cut:
+                        kept.append(sg)
+                    else:
+                        removed.append(sg)
+            queue.extend(kept)
+            saved[key] = removed
+
+        filter_queue(sched.waiting, "waiting")
+        filter_queue(sched.running, "running")
+        filter_queue(sched.swapped, "swapped")
+        return saved
+
+    def _restore_scheduler_queues(self, virtual_engine: int, saved):
+        sched = self.engine.scheduler[virtual_engine]
+
+        def restore(queue, removed):
+            if not removed:
+                return
+            queue.extendleft(reversed(removed))
+
+        restore(sched.swapped, saved.get("swapped", []))
+        restore(sched.running, saved.get("running", []))
+        restore(sched.waiting, saved.get("waiting", []))
     
     @classmethod
     def _get_executor_cls(cls,
@@ -469,12 +612,17 @@ class MolinkEngine(AsyncLLMEngine):
     
     @staticmethod
     async def run_engine_loop(engine_ref: ReferenceType):
+        # head端只启动一个run_engine_loop 协程
+        #  协程是 Python 里的“可挂起/恢复”的轻量级函数，用 async def 定义、用 await 挂起。
+        # 它本身不抢占 CPU，而是由事件循环调度：遇到 await 就把控制权交回事件循环，让别的协程运行，完成后再恢复。相比线程，协程切换开销小、没有并行，适合 IO 或需要大量并发等待的场景。
+        # 成后再恢复。相比线程，协程切换开销小、没有并行，适合 IO 或需要大量并发等待的场景。
         """We use a weakref to the engine so that the running loop
         doesn't prevent the engine being garbage collected."""
         engine: Optional[AsyncLLMEngine] = engine_ref()
         if not engine:
             return
 
+        # 这里是vllm原生的流水线并行，我们没有用到，因此默认为1
         pipeline_parallel_size = \
                 engine.engine.parallel_config.pipeline_parallel_size
         has_requests_in_progress = [False] * pipeline_parallel_size
@@ -504,6 +652,7 @@ class MolinkEngine(AsyncLLMEngine):
                     return
                 logger.debug("Got new requests!")
 
+                # 这里是计算当前应该并行多少个virtual engine
                 batch_num = engine.culculate_batch_num()
 
                 requests_in_progress = [
@@ -557,18 +706,47 @@ class MolinkEngine(AsyncLLMEngine):
         if aborted_requests:
             await self._engine_abort(aborted_requests)
 
-        request_outputs = await self.engine.step_async(virtual_engine, ctx_idx)
+        # Choose a cut_layer bucket in round-robin.
+        available_cuts = self._collect_available_cuts(virtual_engine)
+        rr_idx = self.cut_rr_idx[virtual_engine] % len(available_cuts)
+        target_cut = available_cuts[rr_idx]
+        self.cut_rr_idx[virtual_engine] = (rr_idx + 1) % len(available_cuts) if available_cuts else 0
+
+        # Temporarily hide other cuts from scheduler to avoid mixed batches.
+        saved_queues = self._filter_scheduler_queues(virtual_engine, target_cut)
+        try:
+            request_outputs = await self.engine.step_async(virtual_engine, ctx_idx)
+        finally:
+            self._restore_scheduler_queues(virtual_engine, saved_queues)
+
+        # Sync scheduler cut map with latest executor routes.
+        try:
+            routes = getattr(self.engine.model_executor, "request_routes", {})
+            for rid, info in routes.items():
+                cut = info.get("cut_layer")
+                self.scheduler[virtual_engine].update_cut_layer(rid, cut)
+        except Exception:
+            pass
 
         # Put the outputs into the corresponding streams.
         # If used as a callback, then already invoked inside
         # LLMEngine's _process_model_outputs
-        if not self.use_process_request_outputs_callback:
-            all_finished = self.process_request_outputs(request_outputs)
-        else:
-            # For callback case, we only need to detect when all
-            # requests are finished
-            all_finished = all(request_output.finished
-                               for request_output in request_outputs)
+        try:
+            if not self.use_process_request_outputs_callback:
+                all_finished = self.process_request_outputs(request_outputs)
+            else:
+                # For callback case, we only need to detect when all
+                # requests are finished
+                all_finished = all(request_output.finished
+                                   for request_output in request_outputs)
+        except Exception as e:
+            # If processing fails, unblock scheduler for pending requests.
+            print(f'engine_step exception: {e}, clearing in-flight flags.')
+            try:
+                self.engine.scheduler[virtual_engine].requests_on_fly.clear()
+            except Exception:
+                pass
+            return False
 
         return not all_finished
     
